@@ -1,0 +1,242 @@
+#!/usr/bin/php
+<?php
+class GetGit{
+	public static $base        = 'https://api.github.com/repos/';
+	public static $user        = NULL;
+	
+	public static $branch      = NULL;
+	public static $path        = NULL;
+	public static $repo        = NULL;
+	public static $destination = NULL;
+	public static $recursive   = TRUE;
+
+	public static $create_sync_file = FALSE;
+
+
+	/**
+	 * Main method.  Starts the whole process
+	 */
+	public static function go($argv){
+		self::parseArgs($argv);
+		if(self::$user !== NULL && strpos(self::$user,':') === FALSE){
+			self::getPassword();
+		}
+
+		$start_url = self::$base.self::$repo.'/contents/';
+		if(self::$path !== NULL){
+			$start_url .= self::$path;
+		}
+		if(self::$branch !== NULL){
+			$start_url .= '?ref='.self::$branch;
+		}
+
+		self::retrieve($start_url,self::$destination);
+
+		if(self::$create_sync_file){
+			self::createSyncFile(self::$destination);
+		}
+		echo "\nDone\n\n";
+	}
+
+	/**
+	 * Copies a url to the server
+	 */
+	public static function retrieve($from,$to){
+		echo "Retrieving: $from\n";
+		if(!file_exists($to)){
+			mkdir($to);
+		}
+		$Contents = json_decode(self::read($from));
+		if(json_last_error() != JSON_ERROR_NONE){
+			echo 'JSON parsing error: '.json_last_error_msg()."\n";
+			exit();
+		}
+
+		if(isset($Contents->message)){
+			echo "-----\n";
+			echo 'GitHub message: '.$Contents->message."\n";
+			echo 'Documentation_url: '.$Contents->documentation_url."\n\n";
+			echo "If the error was regarding rate limiting, try invoking with the -u username[:password] option\n";
+			echo "-----\n\n";
+			exit();
+		}
+
+		foreach($Contents as $Entry){
+			if($Entry->type == 'file'){
+				self::write($Entry,$to);
+			}
+			else if($Entry->type == 'dir' && self::$recursive){
+				self::retrieve($Entry->url,$to.$Entry->name.'/');
+			}
+		}
+	}
+
+	/**
+	 * Creates a file
+	 */
+	public function write($Entry,$target_dir){
+		$name = $Entry->name;
+		$content = self::read($Entry->url);
+		$encoded_content = json_decode($content)->content;
+		$decoded_content = base64_decode($encoded_content);
+		echo 'Writing: '.$target_dir.$name."\n";
+		file_put_contents($target_dir.$name, $decoded_content);
+	}
+
+	/**
+	 * Reads a url
+	 */
+	public function read($url){
+		$command = 'curl -s ';// -s hides the download progress meter
+		if(self::$user != NULL){
+			$command .= '-u '.self::$user.' ';
+		}
+		$command .= $url;
+		$content = shell_exec($command);
+
+		return $content;
+	}
+
+	/**
+	 * Parse the arguments
+	 */
+	public static function parseArgs($argv){
+		$options = getopt('p:b:u:r:d:sch',['sync:']);
+
+		// If user wants help, just output the manual and quit
+		if(isset($options['h']) || count($options) == 0){
+			self::outputManual();
+			exit();
+		}
+
+		// If syncing, overwrite any command line arguments
+		// with arguments from the sync file
+		if(isset($options['sync'])){
+			$sync_file_dir = rtrim($options['sync'],'/').'/';
+			$sync_file_path = $sync_file_dir.'git_sync';
+			if(file_exists($sync_file_path)){
+				$contents = file_get_contents($sync_file_dir.'git_sync');
+				$options = json_decode($contents,TRUE);
+			}
+			else{
+				echo "No sync file found.  Run with the -c parameter first.\n";
+				exit();
+			}		
+		}
+
+		self::$repo             = (isset($options['r'])) ? $options['r'] : self::$repo;
+		self::$path             = (isset($options['p'])) ? $options['p'] : self::$path;
+		self::$branch           = (isset($options['b'])) ? $options['b'] : self::$branch;
+		self::$user             = (isset($options['u'])) ? $options['u'] : self::$user;
+		self::$destination      = (isset($options['d'])) ? $options['d'] : self::$destination;
+		self::$recursive        = (isset($options['s'])) ? FALSE : self::$recursive;
+		self::$create_sync_file = (isset($options['c'])) ? TRUE : self::$create_sync_file;
+
+		if(self::$repo === NULL){
+			exit("No repository specified.\n");
+		}
+
+		if(self::$destination === NULL){
+			self::$destination = substr(strrchr(self::$repo,'/'),1);
+		}
+
+		self::$destination = rtrim(self::$destination,'/').'/';
+	}
+
+	// bash commands courtesy of https://www.sitepoint.com/interactive-cli-password-prompt-in-php/
+	public static function getPassword(){
+
+		// Use PHP if bash can't be used
+		$command = "/usr/bin/env bash -c 'echo OK'";
+	    if (rtrim(shell_exec($command)) !== 'OK') {
+	    	$password = readline('Enter your password. Password will appear in plain text: ');
+	    }
+	    else{
+			$command = "/usr/bin/env bash -c 'read -s -p ".addslashes('Password:')." mypassword && echo \$mypassword'";
+			$password = rtrim(shell_exec($command));
+		}
+
+		echo "\n";
+		self::$user = self::$user.':'.$password;
+	}
+
+	public static function createSyncFile($sync_file_path){
+		$params = [
+			'r'=>self::$repo,
+		];
+		if(self::$path !== NULL){
+			$params['p'] = self::$path;
+		}
+		if(self::$branch !== NULL){
+			$params['b'] = self::$branch;
+		}
+		if(self::$user !== NULL){
+			// strip the password from the user before storing
+			$params['u'] = substr(self::$user, 0,strpos(self::$user,':'));
+		}
+		if(self::$destination !== NULL){
+			$params['d'] = self::$destination;
+		}
+		if(self::$recursive === FALSE){
+			$params['s'] = TRUE;
+		}
+		file_put_contents($sync_file_path.'git_sync', json_encode($params));
+	}
+
+	public static function outputManual(){
+		echo <<<MANUAL
+A script for retrieving only certain directories from a GitHub repository.
+Parameters are optional unless otherwise stated
+
+-r    [Required] The repository from which to retrieve.  Ex: twbs/bootstrap
+
+-p    The subdirectory from which to retrieve. Ex: dist
+
+-b    The branch from which to retrieve. Ex: v4-dev
+
+-u    [Recommended] The user to authenticate as.  If just the username is 
+                    provided, you will be prompted for a password.  
+
+                    The password can be also included in the username argument
+                    like so: username:password.
+
+                    This parameter is recommended because the rate limit for
+                    unauthenticated access is 60, but 5000 for authenticated.
+
+-d    The destination directory into which the files should be copied. If 
+      not provided, the directory will be the repository name.
+
+-s    If set, retrieval will be shallow and only files 1 level deep will be 
+      retrieved.  Retrieval is recursive by default.
+
+-c    If set, a sync file will be created in the destination directory.  This
+      file can be used subsequently to sync again without needing to remember
+      all the parameters.
+
+      PASSWORD WILL NOT BE STORED.  You will be prompted for your password again.
+
+--sync    Use to sync a directory that has a git_sync file in it.  Must
+          specify the directory in which to look.
+
+Full example:
+
+gitsubdir -r twbs/bootstrap -p dist -b v4-dev -u johnny5 -d boots -c
+
+This will retrieve all the files and directories in the "dist" directory 
+of the "v4-dev" branch of the "twbs/bootstrap" repository.  The files and
+directories will be created locally in the "boots" directory.  The command will
+be run after authenticating as the "johnny5" user.  After completing the retrieval,
+a "git_sync" file will be created in the "boots" directory.  From here on out, you
+can call:
+
+gitsubdir --sync boots
+
+And the files will be retrieved in the same manner they were initially.
+\n
+MANUAL;
+	}
+}
+
+GetGit::go($argv);
+
+?>
